@@ -6,6 +6,7 @@ from kcidb.io import schema
 from kcidb import orm, db, oo
 from kcidb.monitor.output import NotificationMessage, Notification,\
     NOTIFICATION_MESSAGE_SUBJECT_MAX_LEN, NOTIFICATION_MESSAGE_BODY_MAX_LEN
+from kcidb.unittest import local_only
 
 
 # Disable long line checking for JSON data
@@ -13,6 +14,7 @@ from kcidb.monitor.output import NotificationMessage, Notification,\
 # pylint: disable=line-too-long
 
 
+@local_only
 class NotificationTestCase(unittest.TestCase):
     """kcidb.monitor.output.Notification test case"""
 
