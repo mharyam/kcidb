@@ -136,7 +136,7 @@ jobs:
         run: |
           status=0
           declare -a args=("kernelci-staging" "gh_run_${{ github.run_id }}")
-          declare -a env_args=("${args[@]}" --heavy-asserts)
+          declare -a env_args=("${args[@]}" --smtp-mocked --heavy-asserts)
           env=$(./cloud env --format=sh "${env_args[@]}")
 
           ./cloud deploy "${env_args[@]}" --verbose --smtp-password-file=<(echo foobar) || status=$((status || $?))
