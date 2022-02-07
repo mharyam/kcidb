@@ -1,5 +1,7 @@
 """Kernel CI message queue"""
 
+import math
+import datetime
 import json
 import logging
 import threading
@@ -210,51 +212,130 @@ class Subscriber(ABC):
         """
         self.client.delete_subscription(subscription=self.subscription_path)
 
-    def pull(self, max_num, timeout=0):
+    def pull_iter(self, max_num=None, timeout=None):
         """
-        Pull published data from the message queue, discarding (and logging as
-        errors) invalid data.
+        Create a generator iterator pulling published data from the message
+        queue, discarding (and logging as errors) invalid data. The generator
+        stops pulling when either the specified number of messages is
+        retrieved or the specified timeout expires.
 
         Args:
-            max_num:    Maximum number of data messages to pull and return.
-            timeout:    Maximum time to wait for request to complete, seconds,
-                        or zero for infinite timeout. Default is zero.
+            max_num:    Maximum number of messages to pull, or None for
+                        unlimited number of messages. Default is None.
+            timeout:    A datetime.timedelta object representing the maximum
+                        time to spend retrieving "max_num" messages, a finite
+                        number representing the seconds to spend, or None for
+                        datetime.timedelta.max. Default is None.
 
         Returns:
-            A list of "messages" - tuples containing the data received within
-            the timeout, each with two items:
+            A generator iterator returning messages - tuples, each with two
+            items:
             * The ID to use when acknowledging the reception of the data.
             * The decoded data from the message queue.
         """
-        assert isinstance(max_num, int)
-        assert isinstance(timeout, (int, float))
-        messages = []
+        # Yeah, could be better, pylint: disable=too-many-branches
+        assert max_num is None or isinstance(max_num, int)
+        assert timeout is None or \
+            isinstance(timeout, datetime.timedelta) or \
+            isinstance(timeout, (int, float)) and math.isfinite(timeout)
+        if max_num is None:
+            max_num = math.inf
+        if timeout is None:
+            timeout = datetime.timedelta.max
+        elif isinstance(timeout, (int, float)):
+            timeout = datetime.timedelta(seconds=timeout)
+
+        received_num = 0
+        start_time = None
         while True:
-            try:
-                # Setting *some* timeout, because infinite timeout doesn't
-                # seem to be supported
-                response = self.client.pull(
-                        subscription=self.subscription_path,
-                        max_messages=max_num,
-                        timeout=timeout or 300)
-                messages = response.received_messages
-            except DeadlineExceeded:
-                pass
-            if timeout or messages:
+            # Get the current time
+            current_time = datetime.datetime.now(datetime.timezone.utc)
+            if start_time is None:
+                start_time = current_time
+
+            # Check we're within budget
+            elapsed_time = current_time - start_time
+            if received_num >= max_num:
+                LOGGER.debug("Received enough messages, stopping pulling")
+                break
+            if elapsed_time >= timeout:
+                LOGGER.debug("Ran out of time, stopping pulling")
                 break
 
-        items = []
-        for message in messages:
+            # Try getting messages
             try:
-                data = self.decode_data(message.message.data)
-            # This is good enough for now, pylint: disable=broad-except
-            except Exception as err:
-                LOGGER.error("%s\nFailed decoding, dropping message:\n%s",
-                             misc.format_exception_stack(err),
-                             message.message.data)
-                self.ack(message.ack_id)
-            items.append((message.ack_id, data))
-        return items
+                # Cap number of messages in one request
+                pull_max_messages = min(max_num - received_num, 256)
+                pull_timeout = (timeout - elapsed_time).total_seconds()
+                LOGGER.debug("Pulling <= %u messages, "
+                             "with timeout %us...",
+                             pull_max_messages, pull_timeout)
+                response = self.client.pull(
+                    subscription=self.subscription_path,
+                    max_messages=pull_max_messages,
+                    timeout=pull_timeout
+                )
+                messages = response.received_messages
+                LOGGER.debug("Pulled %u messages", len(messages))
+            except DeadlineExceeded:
+                LOGGER.debug("Deadline exceeded")
+                messages = ()
+
+            # Yield received message data
+            i = 0
+            try:
+                for i, message in enumerate(messages):
+                    try:
+                        data = self.decode_data(message.message.data)
+                    # This is good enough for now,
+                    # pylint: disable=broad-except
+                    except Exception as err:
+                        LOGGER.error("%s\nFailed decoding, ACK'ing and "
+                                     "dropping message:\n%s",
+                                     misc.format_exception_stack(err),
+                                     message.message.data)
+                        self.ack(message.ack_id)
+                        continue
+                    received_num += 1
+                    yield (message.ack_id, data)
+            finally:
+                # Skip the last-processed message
+                i += 1
+                # NACK unprocessed messages, if any
+                if i < len(messages):
+                    self.client.modify_ack_deadline(
+                        subscription=self.subscription_path,
+                        ack_ids=[m.ack_id for m in messages[i:]],
+                        ack_deadline_seconds=0
+                    )
+                    LOGGER.debug("NACK'ed %s messages", len(messages) - i)
+
+    def pull(self, max_num=1, timeout=None):
+        """
+        Pull published data from the message queue, discarding (and logging as
+        errors) invalid data. Stop pulling when either the specified number of
+        messages is retrieved or the specified timeout expires.
+
+        Args:
+            max_num:    Maximum number of messages to pull, or None for
+                        unlimited number of messages. Cannot be None, if
+                        "timeout" is None. Default is 1.
+            timeout:    A datetime.timedelta object representing the maximum
+                        time to spend retrieving "max_num" messages, a finite
+                        number representing the seconds to spend, or None for
+                        datetime.timedelta.max. Default is None.
+
+        Returns:
+            A list of messages - tuples, each with two items:
+            * The ID to use when acknowledging the reception of the data.
+            * The decoded data from the message queue.
+        """
+        assert max_num is None or isinstance(max_num, int)
+        assert timeout is None or \
+            isinstance(timeout, datetime.timedelta) or \
+            isinstance(timeout, (int, float)) and math.isfinite(timeout)
+        assert max_num is not None or timeout is not None
+        return list(self.pull_iter(max_num, timeout))
 
     def ack(self, ack_id):
         """
