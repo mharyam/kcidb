@@ -406,6 +406,96 @@ class IOSubscriber(Subscriber):
         data = json.loads(message_data.decode())
         return io.schema.upgrade(io.schema.validate(data), copy=False)
 
+    # We'll be OK, pylint: disable=arguments-differ
+    def pull_iter(self, max_num=None, timeout=None, max_obj=None):
+        """
+        Create a generator iterator pulling published data from the message
+        queue, discarding (and logging as errors) invalid data. The generator
+        stops pulling when either the specified number of messages is
+        retrieved, the specified number of objects is retrieved within the
+        messages, or the specified timeout expires.
+
+        Args:
+            max_num:    Maximum number of messages to pull, or None for
+                        unlimited number of messages. Default is None.
+            timeout:    A datetime.timedelta object representing the maximum
+                        time to spend retrieving "max_num" messages, a finite
+                        number representing the seconds to spend, or None for
+                        datetime.timedelta.max. Default is None.
+            max_obj:    Maximum number of objects to pull within messages, or
+                        None for no limit. First pulled message is allowed to
+                        exceed the limit. Default is None.
+
+        Returns:
+            A generator iterator returning messages - tuples, each with two
+            items:
+            * The ID to use when acknowledging the reception of the data.
+            * The decoded data from the message queue.
+        """
+        assert max_num is None or isinstance(max_num, int)
+        assert timeout is None or \
+            isinstance(timeout, datetime.timedelta) or \
+            isinstance(timeout, (int, float)) and math.isfinite(timeout)
+        assert max_obj is None or isinstance(max_obj, int)
+        if max_obj is None:
+            max_obj = math.inf
+
+        msg_num = 0
+        obj_num = 0
+        msg_pull_iter = super().pull_iter(max_num=max_num, timeout=timeout)
+        try:
+            for msg in msg_pull_iter:
+                msg_obj_num = kcidb.io.count(msg[1])
+                obj_num += msg_obj_num
+                if msg_num > 0 and obj_num > max_obj:
+                    LOGGER.debug("Message #%u crossed %u-object boundary "
+                                 "at %u total objects, NACK'ing",
+                                 msg_num + 1, max_obj, obj_num)
+                    self.nack(msg[0])
+                    obj_num -= msg_obj_num
+                    break
+                msg_num += 1
+                yield msg
+            if obj_num >= max_obj:
+                LOGGER.debug("Received enough objects")
+        finally:
+            msg_pull_iter.close()
+
+    # We'll be OK, pylint: disable=arguments-differ
+    def pull(self, max_num=1, timeout=None, max_obj=None):
+        """
+        Pull published data from the message queue, discarding (and logging as
+        errors) invalid data. Stop pulling when either the specified number of
+        messages is retrieved, the specified number of objects is retrieved
+        within the messages, or the specified timeout expires.
+
+        Args:
+            max_num:    Maximum number of messages to pull, or None for
+                        unlimited number of messages. Cannot be None, if both
+                        "timeout" and "max_obj" are None. Default is 1.
+            timeout:    A datetime.timedelta object representing the maximum
+                        time to spend retrieving "max_num" messages, a finite
+                        number representing the seconds to spend, or None for
+                        datetime.timedelta.max. Default is None.
+            max_obj:    Maximum number of objects to pull within messages, or
+                        None for no limit. First pulled message is allowed to
+                        exceed the limit. Default is None.
+
+        Returns:
+            A list of messages - tuples, each with two items:
+            * The ID to use when acknowledging the reception of the data.
+            * The decoded data from the message queue.
+        """
+        assert max_num is None or isinstance(max_num, int)
+        assert timeout is None or \
+            isinstance(timeout, datetime.timedelta) or \
+            isinstance(timeout, (int, float)) and math.isfinite(timeout)
+        assert max_obj is None or isinstance(max_obj, int)
+        assert max_num is not None or \
+            timeout is not None or \
+            max_obj is not None
+        return list(self.pull_iter(max_num, timeout, max_obj))
+
 
 class ORMPatternPublisher(Publisher):
     """ORM pattern queue publisher"""
