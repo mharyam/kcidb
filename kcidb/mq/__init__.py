@@ -1,10 +1,15 @@
 """Kernel CI message queue"""
 
+import math
+import datetime
 import json
 import logging
 import threading
 import sys
 import argparse
+import email
+import email.message
+import email.policy
 from abc import ABC, abstractmethod
 from google.cloud import pubsub
 from google.api_core.exceptions import DeadlineExceeded
@@ -184,7 +189,7 @@ class Subscriber(ABC):
             topic_name:         Name of the message queue topic to subscribe
                                 to.
             subscription_name:  Name of the subscription to use.
-            client:             The Google Pub/Sub PublisherClient to use, or
+            client:             The Google Pub/Sub SubscriberClient to use, or
                                 None to create and use one with default
                                 settings.
         """
@@ -207,51 +212,116 @@ class Subscriber(ABC):
         """
         self.client.delete_subscription(subscription=self.subscription_path)
 
-    def pull(self, max_num, timeout=0):
+    def pull_iter(self, max_num=math.inf, timeout=math.inf):
         """
-        Pull published data from the message queue, discarding (and logging as
-        errors) invalid data.
+        Create a generator iterator pulling published data from the message
+        queue, discarding (and logging as errors) invalid data. The generator
+        stops pulling when either the specified number of messages is
+        retrieved or the specified timeout expires.
 
         Args:
-            max_num:    Maximum number of data messages to pull and return.
-            timeout:    Maximum time to wait for request to complete, seconds,
-                        or zero for infinite timeout. Default is zero.
+            max_num:    Maximum number of messages to pull, or infinity for
+                        unlimited number of messages. Default is infinity.
+            timeout:    A finite number representing the seconds to spend
+                        retrieving "max_num" messages, or infinity to wait
+                        for messages forever. Default is infinity.
 
         Returns:
-            A list of "messages" - tuples containing the data received within
-            the timeout, each with two items:
+            A generator iterator returning messages - tuples, each with two
+            items:
             * The ID to use when acknowledging the reception of the data.
             * The decoded data from the message queue.
         """
-        assert isinstance(max_num, int)
+        assert isinstance(max_num, (int, float))
         assert isinstance(timeout, (int, float))
-        messages = []
+        received_num = 0
+        start_time = None
         while True:
-            try:
-                # Setting *some* timeout, because infinite timeout doesn't
-                # seem to be supported
-                response = self.client.pull(
-                        subscription=self.subscription_path,
-                        max_messages=max_num,
-                        timeout=timeout or 300)
-                messages = response.received_messages
-            except DeadlineExceeded:
-                pass
-            if timeout or messages:
+            # Get the current time
+            current_time = datetime.datetime.now(datetime.timezone.utc)
+            if start_time is None:
+                start_time = current_time
+
+            # Check we're within budget
+            elapsed_seconds = (current_time - start_time).total_seconds()
+            if received_num >= max_num:
+                LOGGER.debug("Received enough messages, stopping pulling")
+                break
+            if elapsed_seconds >= timeout:
+                LOGGER.debug("Ran out of time, stopping pulling")
                 break
 
-        items = []
-        for message in messages:
+            # Try getting messages
             try:
-                data = self.decode_data(message.message.data)
-            # This is good enough for now, pylint: disable=broad-except
-            except Exception as err:
-                LOGGER.error("%s\nFailed decoding, dropping message:\n%s",
-                             misc.format_exception_stack(err),
-                             message.message.data)
-                self.ack(message.ack_id)
-            items.append((message.ack_id, data))
-        return items
+                # Cap messages/timeout to something PubSub API can handle
+                pull_max_messages = int(min(max_num - received_num, 256))
+                pull_timeout = min(timeout - elapsed_seconds, 3600)
+                LOGGER.debug("Pulling <= %u messages, "
+                             "with timeout %us...",
+                             pull_max_messages, pull_timeout)
+                response = self.client.pull(
+                    subscription=self.subscription_path,
+                    max_messages=pull_max_messages,
+                    timeout=pull_timeout
+                )
+                messages = response.received_messages
+                LOGGER.debug("Pulled %u messages", len(messages))
+            except DeadlineExceeded:
+                LOGGER.debug("Deadline exceeded")
+                messages = ()
+
+            # Yield received message data
+            i = 0
+            try:
+                for i, message in enumerate(messages):
+                    try:
+                        data = self.decode_data(message.message.data)
+                    # This is good enough for now,
+                    # pylint: disable=broad-except
+                    except Exception as err:
+                        LOGGER.error("%s\nFailed decoding, ACK'ing and "
+                                     "dropping message:\n%s",
+                                     misc.format_exception_stack(err),
+                                     message.message.data)
+                        self.ack(message.ack_id)
+                        continue
+                    received_num += 1
+                    yield (message.ack_id, data)
+            finally:
+                # Skip the last-processed message
+                i += 1
+                # NACK unprocessed messages, if any
+                if i < len(messages):
+                    self.client.modify_ack_deadline(
+                        subscription=self.subscription_path,
+                        ack_ids=[m.ack_id for m in messages[i:]],
+                        ack_deadline_seconds=0
+                    )
+                    LOGGER.debug("NACK'ed %s messages", len(messages) - i)
+
+    def pull(self, max_num=1, timeout=math.inf):
+        """
+        Pull published data from the message queue, discarding (and logging as
+        errors) invalid data. Stop pulling when either the specified number of
+        messages is retrieved or the specified timeout expires.
+
+        Args:
+            max_num:    Maximum number of messages to pull, or infinity for
+                        unlimited number of messages. Cannot be infinity, if
+                        "timeout" is infinity. Default is infinity.
+            timeout:    A finite number representing the seconds to spend
+                        retrieving "max_num" messages, or infinity to wait
+                        for messages forever. Default is infinity.
+
+        Returns:
+            A list of messages - tuples, each with two items:
+            * The ID to use when acknowledging the reception of the data.
+            * The decoded data from the message queue.
+        """
+        assert isinstance(max_num, (int, float))
+        assert isinstance(timeout, (int, float))
+        assert max_num != math.inf or timeout != math.inf
+        return list(self.pull_iter(max_num, timeout))
 
     def ack(self, ack_id):
         """
@@ -322,6 +392,88 @@ class IOSubscriber(Subscriber):
         data = json.loads(message_data.decode())
         return io.SCHEMA.upgrade(io.SCHEMA.validate(data), copy=False)
 
+    # We'll be OK, pylint: disable=arguments-differ
+    def pull_iter(self, max_num=math.inf, timeout=math.inf, max_obj=math.inf):
+        """
+        Create a generator iterator pulling published data from the message
+        queue, discarding (and logging as errors) invalid data. The generator
+        stops pulling when either the specified number of messages is
+        retrieved, the specified number of objects is retrieved within the
+        messages, or the specified timeout expires.
+
+        Args:
+            max_num:    Maximum number of messages to pull, or infinity for
+                        unlimited number of messages. Default is infinity.
+            timeout:    A finite number representing the seconds to spend
+                        retrieving "max_num" messages, or infinity to wait
+                        for messages forever. Default is infinity.
+            max_obj:    Maximum number of objects to pull within messages, or
+                        infinity for no limit. First pulled message is allowed
+                        to exceed the limit. Default is infinity.
+
+        Returns:
+            A generator iterator returning messages - tuples, each with two
+            items:
+            * The ID to use when acknowledging the reception of the data.
+            * The decoded data from the message queue.
+        """
+        assert isinstance(max_num, (int, float))
+        assert isinstance(timeout, (int, float))
+        assert isinstance(max_obj, (int, float))
+        msg_num = 0
+        obj_num = 0
+        msg_pull_iter = super().pull_iter(max_num=max_num, timeout=timeout)
+        try:
+            for msg in msg_pull_iter:
+                msg_obj_num = io.SCHEMA.count(msg[1])
+                obj_num += msg_obj_num
+                if msg_num > 0 and obj_num > max_obj:
+                    LOGGER.debug("Message #%u crossed %u-object boundary "
+                                 "at %u total objects, NACK'ing",
+                                 msg_num + 1, max_obj, obj_num)
+                    self.nack(msg[0])
+                    obj_num -= msg_obj_num
+                    break
+                msg_num += 1
+                yield msg
+            if obj_num >= max_obj:
+                LOGGER.debug("Received enough objects")
+        finally:
+            msg_pull_iter.close()
+
+    # We'll be OK, pylint: disable=arguments-differ
+    def pull(self, max_num=1, timeout=None, max_obj=None):
+        """
+        Pull published data from the message queue, discarding (and logging as
+        errors) invalid data. Stop pulling when either the specified number of
+        messages is retrieved, the specified number of objects is retrieved
+        within the messages, or the specified timeout expires.
+
+        Args:
+            max_num:    Maximum number of messages to pull, or infinity for
+                        unlimited number of messages. Cannot be infinity, if
+                        both "timeout" and "max_obj" are infinity.
+                        Default is infinity.
+            timeout:    A finite number representing the seconds to spend
+                        retrieving "max_num" messages and/or "max_obj"
+                        objects, or infinity to wait for messages forever.
+                        Default is infinity.
+            max_obj:    Maximum number of objects to pull within messages, or
+                        infinity for no limit. First pulled message is allowed
+                        to exceed the limit. Default is infinity.
+
+        Returns:
+            A list of messages - tuples, each with two items:
+            * The ID to use when acknowledging the reception of the data.
+            * The decoded data from the message queue.
+        """
+        assert isinstance(max_num, (int, float))
+        assert isinstance(timeout, (int, float))
+        assert isinstance(max_obj, (int, float))
+        assert max_num != math.inf or timeout != math.inf or \
+            max_obj != math.inf
+        return list(self.pull_iter(max_num, timeout, max_obj))
+
 
 class ORMPatternPublisher(Publisher):
     """ORM pattern queue publisher"""
@@ -371,6 +523,59 @@ class ORMPatternSubscriber(Subscriber):
         for line in message_data.decode().splitlines():
             pattern_set |= kcidb.orm.Pattern.parse(line)
         return pattern_set
+
+
+class EmailPublisher(Publisher):
+    """Email queue publisher"""
+
+    @staticmethod
+    def encode_data(data):
+        """
+        Encode an email, into message data.
+
+        Args:
+            data:   The email to encode.
+
+        Returns
+            The encoded message data.
+
+        Raises:
+            An exception in case data encoding failed.
+        """
+        assert isinstance(data, email.message.EmailMessage)
+        return data.as_string(policy=email.policy.SMTPUTF8).encode()
+
+
+class EmailSubscriber(Subscriber):
+    """Email queue subscriber"""
+
+    def decode_data(self, message_data):
+        """
+        Decode email from the message data.
+
+        Args:
+            message_data:   The message data from the message queue
+                            ("data" field of pubsub.types.PubsubMessage) to be
+                            decoded.
+
+        Returns
+            The decoded email (email.message.EmailMessage) object.
+
+        Raises:
+            An exception in case data decoding failed.
+        """
+        return self.parser.parsestr(message_data.decode())
+
+    def __init__(self, *args, **kwargs):
+        """
+        Initialize the email subscriber.
+
+        Args:
+            args:   The positional arguments to initialize Subscriber with.
+            kwargs: The keyword arguments to initialize Subscriber with.
+        """
+        super().__init__(*args, **kwargs)
+        self.parser = email.parser.Parser(policy=email.policy.SMTPUTF8)
 
 
 def argparse_add_args(parser):
@@ -496,8 +701,18 @@ def argparse_subscriber_add_args(parser, data_name):
         metavar="SECONDS",
         type=float,
         help='Wait the specified number of SECONDS for a message, '
-             'or forever, if zero. Default is zero.',
-        default=0,
+             'or "inf" for infinity. Default is "inf".',
+        default=math.inf,
+        required=False
+    )
+    parser.subparsers["pull"].add_argument(
+        '-m',
+        '--messages',
+        metavar="NUMBER",
+        type=misc.non_negative_int_or_inf,
+        help='Pull maximum NUMBER of messages, or "inf" for infinity. '
+             'Default is 1.',
+        default=1,
         required=False
     )
 
@@ -567,9 +782,8 @@ def io_subscriber_main():
     elif args.command == "cleanup":
         subscriber.cleanup()
     elif args.command == "pull":
-        items = subscriber.pull(1, timeout=args.timeout)
-        if items:
-            ack_id, data = items[0]
+        for ack_id, data in \
+                subscriber.pull_iter(args.messages, timeout=args.timeout):
             misc.json_dump(data, sys.stdout, indent=args.indent, seq=args.seq)
             sys.stdout.flush()
             subscriber.ack(ack_id)
@@ -621,11 +835,49 @@ def pattern_subscriber_main():
     elif args.command == "cleanup":
         subscriber.cleanup()
     elif args.command == "pull":
-        items = subscriber.pull(1, timeout=args.timeout)
-        if items:
-            ack_id, data = items[0]
+        for ack_id, data in \
+                subscriber.pull_iter(args.messages, timeout=args.timeout):
             sys.stdout.write("".join(
                 repr(pattern) + "\n" for pattern in data
             ))
+            sys.stdout.flush()
+            subscriber.ack(ack_id)
+
+
+def email_publisher_main():
+    """Execute the kcidb-mq-email-publisher command-line tool"""
+    sys.excepthook = misc.log_and_print_excepthook
+    description = \
+        'kcidb-mq-email-publisher - ' \
+        'Kernel CI email queue publisher management tool'
+    parser = PublisherArgumentParser("email", description=description)
+    args = parser.parse_args()
+    publisher = EmailPublisher(args.project, args.topic)
+    if args.command == "init":
+        publisher.init()
+    elif args.command == "cleanup":
+        publisher.cleanup()
+    elif args.command == "publish":
+        parser = email.parser.Parser(policy=email.policy.SMTPUTF8)
+        publisher.publish(parser.parse(sys.stdin))
+
+
+def email_subscriber_main():
+    """Execute the kcidb-mq-email-subscriber command-line tool"""
+    sys.excepthook = misc.log_and_print_excepthook
+    description = \
+        'kcidb-mq-email-subscriber - ' \
+        'Kernel CI email queue subscriber management tool'
+    parser = SubscriberArgumentParser("email", description=description)
+    args = parser.parse_args()
+    subscriber = EmailSubscriber(args.project, args.topic, args.subscription)
+    if args.command == "init":
+        subscriber.init()
+    elif args.command == "cleanup":
+        subscriber.cleanup()
+    elif args.command == "pull":
+        for ack_id, data in \
+                subscriber.pull_iter(args.messages, timeout=args.timeout):
+            sys.stdout.write(data.as_string(policy=email.policy.SMTPUTF8))
             sys.stdout.flush()
             subscriber.ack(ack_id)

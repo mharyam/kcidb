@@ -9,6 +9,7 @@ import smtplib
 import kcidb
 
 
+# Name of the Google Cloud project we're deployed in
 PROJECT_ID = os.environ["GCP_PROJECT"]
 
 kcidb.misc.logging_setup(
@@ -16,37 +17,70 @@ kcidb.misc.logging_setup(
 )
 LOGGER = logging.getLogger()
 
+# The subscriber object for the submission queue
 LOAD_QUEUE_SUBSCRIBER = kcidb.mq.IOSubscriber(
     PROJECT_ID,
     os.environ["KCIDB_LOAD_QUEUE_TOPIC"],
     os.environ["KCIDB_LOAD_QUEUE_SUBSCRIPTION"]
 )
+# Maximum number of messages loaded from the submission queue in one go
 LOAD_QUEUE_MSG_MAX = int(os.environ["KCIDB_LOAD_QUEUE_MSG_MAX"])
+# Maximum number of objects loaded from the submission queue in one go
 LOAD_QUEUE_OBJ_MAX = int(os.environ["KCIDB_LOAD_QUEUE_OBJ_MAX"])
+# Maximum time for pulling maximum amount of submissions from the queue
 LOAD_QUEUE_TIMEOUT_SEC = float(os.environ["KCIDB_LOAD_QUEUE_TIMEOUT_SEC"])
 
+# String specifying the database to access,
+# i.e. the kcidb.db.Client.__init__() argument.
 DATABASE = os.environ["KCIDB_DATABASE"]
+# Minimum time between loading submissions into the database
 DATABASE_LOAD_PERIOD = datetime.timedelta(
     seconds=int(os.environ["KCIDB_DATABASE_LOAD_PERIOD_SEC"])
 )
 
+# A whitespace-separated list of subscription names to limit notifying to
 SELECTED_SUBSCRIPTIONS = \
     os.environ.get("KCIDB_SELECTED_SUBSCRIPTIONS", "").split()
 
+# A Firestore path to the collection for spooled notifications
 SPOOL_COLLECTION_PATH = os.environ["KCIDB_SPOOL_COLLECTION_PATH"]
 
-EXTRA_CC = os.environ.get("KCIDB_EXTRA_CC", None)
+# The address of the SMTP host to send notifications through
 SMTP_HOST = os.environ["KCIDB_SMTP_HOST"]
+# The port of the SMTP server to send notifications through
 SMTP_PORT = int(os.environ["KCIDB_SMTP_PORT"])
+# The username to authenticate to SMTP server with
 SMTP_USER = os.environ["KCIDB_SMTP_USER"]
+# The name of the Google Secret Manager's "secret" with SMTP user's password
 SMTP_PASSWORD_SECRET = os.environ["KCIDB_SMTP_PASSWORD_SECRET"]
+# The SMTP user's password
 SMTP_PASSWORD = kcidb.misc.get_secret(PROJECT_ID, SMTP_PASSWORD_SECRET)
-SMTP_FROM_ADDR = os.environ.get("KCIDB_SMTP_FROM_ADDR", None)
+# The address to tell the SMTP server to send the message to,
+# overriding any recipients in the message itself.
 SMTP_TO_ADDRS = os.environ.get("KCIDB_SMTP_TO_ADDRS", None)
+# The name of the PubSub topic to post email messages to, instead of sending
+# them to the SMTP server with SMTP_* parameters specified above. If
+# specified, those parameters are ignored.
+SMTP_TOPIC = os.environ.get("KCIDB_SMTP_TOPIC", None)
+# The publisher object for email messages, if we're requested to send them to
+# a PubSub topic
+SMTP_PUBLISHER = None if SMTP_TOPIC is None \
+    else kcidb.mq.EmailPublisher(PROJECT_ID, SMTP_TOPIC)
+# The name of the subscription for email messages posted to the SMTP topic
+SMTP_SUBSCRIPTION = os.environ.get("KCIDB_SMTP_SUBSCRIPTION", None)
+# The address to use as the "From" address in sent notifications
+SMTP_FROM_ADDR = os.environ.get("KCIDB_SMTP_FROM_ADDR", None)
+# A string to be added to the CC header of notifications being sent out
+EXTRA_CC = os.environ.get("KCIDB_EXTRA_CC", None)
 
+# The database client instance
 DB_CLIENT = kcidb.db.Client(DATABASE)
+# The object-oriented database client instance
 OO_CLIENT = kcidb.oo.Client(DB_CLIENT)
+# The notification spool client
 SPOOL_CLIENT = kcidb.monitor.spool.Client(SPOOL_COLLECTION_PATH)
+# The publisher object for the queue with patterns matching objects updated by
+# loading submissions.
 UPDATED_QUEUE_PUBLISHER = kcidb.mq.ORMPatternPublisher(
     PROJECT_ID,
     os.environ["KCIDB_UPDATED_QUEUE_TOPIC"]
@@ -74,75 +108,6 @@ def kcidb_load_message(event, context):
     UPDATED_QUEUE_PUBLISHER.publish(pattern_set)
 
 
-def kcidb_load_queue_msgs(subscriber, msg_max, obj_max, timeout_sec):
-    """
-    Pull I/O data messages from a subscriber with a limit on message number,
-    total object number and time spent.
-
-    Args:
-        subscriber:     The subscriber (kcidb.mq.Subscriber) to pull from.
-        msg_max:        Maximum number of messages to pull.
-        obj_max:        Maximum number of objects to pull.
-        timeout_sec:    Maximum number of seconds to spend.
-
-    Returns:
-        The list of pulled messages.
-    """
-    # Yeah it's crowded, but bear with us, pylint: disable=too-many-locals
-    # Pull data from queue until we get enough, or time runs out
-    start = datetime.datetime.now(datetime.timezone.utc)
-    obj_num = 0
-    pulls = 0
-    msgs = []
-    while True:
-        # Calculate remaining messages
-        pull_msg_max = msg_max - len(msgs)
-        if pull_msg_max <= 0:
-            LOGGER.debug("Received enough messages")
-            break
-
-        # Calculate remaining time
-        pull_timeout_sec = \
-            timeout_sec - \
-            (datetime.datetime.now(datetime.timezone.utc) - start). \
-            total_seconds()
-        if pull_timeout_sec <= 0:
-            LOGGER.debug("Ran out of time")
-            break
-
-        # Pull
-        LOGGER.debug("Pulling <= %u messages from the queue, "
-                     "with timeout %us...", pull_msg_max, pull_timeout_sec)
-        pull_msgs = subscriber.pull(pull_msg_max, timeout=pull_timeout_sec)
-        pulls += 1
-        LOGGER.debug("Pulled %u messages", len(pull_msgs))
-
-        # Add messages up to obj_max, except the first one
-        for index, msg in enumerate(pull_msgs):
-            msg_obj_num = kcidb.io.SCHEMA.count(msg[1])
-            obj_num += msg_obj_num
-            if msgs and obj_num > obj_max:
-                LOGGER.debug("Message #%u crossed %u-object boundary "
-                             "at %u total objects",
-                             len(msgs) + 1, obj_max, obj_num)
-                obj_num -= msg_obj_num
-                for nack_msg in pull_msgs[index:]:
-                    subscriber.nack(nack_msg[0])
-                LOGGER.debug("NACK'ed %s messages", len(pull_msgs) - index)
-                break
-            msgs.append(msg)
-        else:
-            continue
-        break
-
-    duration_seconds = \
-        (datetime.datetime.now(datetime.timezone.utc) - start).total_seconds()
-    LOGGER.debug("Pulled %u messages, %u objects total "
-                 "in %u pulls and %u seconds",
-                 len(msgs), obj_num, pulls, duration_seconds)
-    return msgs
-
-
 def kcidb_load_queue(event, context):
     """
     Load multiple KCIDB data messages from the LOAD_QUEUE_SUBSCRIBER queue
@@ -158,10 +123,11 @@ def kcidb_load_queue(event, context):
         return
 
     # Pull messages
-    msgs = kcidb_load_queue_msgs(LOAD_QUEUE_SUBSCRIBER,
-                                 LOAD_QUEUE_MSG_MAX,
-                                 LOAD_QUEUE_OBJ_MAX,
-                                 LOAD_QUEUE_TIMEOUT_SEC)
+    msgs = LOAD_QUEUE_SUBSCRIBER.pull(
+        max_num=LOAD_QUEUE_MSG_MAX,
+        timeout=LOAD_QUEUE_TIMEOUT_SEC,
+        max_obj=LOAD_QUEUE_OBJ_MAX
+    )
     if msgs:
         LOGGER.info("Pulled %u messages", len(msgs))
     else:
@@ -273,15 +239,19 @@ def send_message(message):
             message.replace_header("CC", cc_addrs + ", " + EXTRA_CC)
         else:
             message["CC"] = EXTRA_CC
-    # Connect to the SMTP server
-    smtp = smtplib.SMTP(host=SMTP_HOST, port=SMTP_PORT)
-    smtp.ehlo()
-    smtp.starttls()
-    smtp.ehlo()
-    smtp.login(SMTP_USER, SMTP_PASSWORD)
-    try:
-        # Send message
-        smtp.send_message(message, to_addrs=SMTP_TO_ADDRS)
-    finally:
-        # Disconnect from the SMTP server
-        smtp.quit()
+    # If we're requested to divert messages to a PubSub topic
+    if SMTP_PUBLISHER is not None:
+        SMTP_PUBLISHER.publish(message)
+    else:
+        # Connect to the SMTP server
+        smtp = smtplib.SMTP(host=SMTP_HOST, port=SMTP_PORT)
+        smtp.ehlo()
+        smtp.starttls()
+        smtp.ehlo()
+        smtp.login(SMTP_USER, SMTP_PASSWORD)
+        try:
+            # Send message
+            smtp.send_message(message, to_addrs=SMTP_TO_ADDRS)
+        finally:
+            # Disconnect from the SMTP server
+            smtp.quit()
