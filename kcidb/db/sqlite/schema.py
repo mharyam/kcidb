@@ -5,6 +5,7 @@ Always corresponds to the current I/O schema.
 """
 import json
 from enum import Enum
+import dateutil.parser
 
 
 class Constraint(Enum):
@@ -16,7 +17,23 @@ class Constraint(Enum):
 class Column:
     """A column description"""
 
-    def __init__(self, type, constraint=None, pack=None, unpack=None):
+    @staticmethod
+    def pack(value):
+        """
+        Pack the JSON representation of the column value into the SQLite
+        representation.
+        """
+        return value
+
+    @staticmethod
+    def unpack(value):
+        """
+        Unpack the SQLite representation of the column value into the JSON
+        representation.
+        """
+        return value
+
+    def __init__(self, type, constraint=None):
         """
         Initialize the column description.
 
@@ -26,19 +43,11 @@ class Column:
             constraint:     The column's constraint.
                             A member of the Constraint enum, or None,
                             meaning no constraint.
-            pack:           The function packing the JSON representation of
-                            column's values into the SQLite representation.
-            unpack:         The function unpacking the SQLite representation
-                            of column's values into the JSON representation.
         """
         assert isinstance(type, str)
         assert constraint is None or isinstance(constraint, Constraint)
-        assert pack is None or callable(pack)
-        assert unpack is None or callable(unpack)
         self.type = type
         self.constraint = constraint
-        self.pack = pack or (lambda x: x)
-        self.unpack = unpack or (lambda x: x)
 
     def format_nameless_def(self):
         """
@@ -57,6 +66,14 @@ class Column:
 class BoolColumn(Column):
     """A boolean column"""
 
+    @staticmethod
+    def unpack(value):
+        """
+        Unpack the SQLite representation of the column value into the JSON
+        representation.
+        """
+        return bool(value) if value is not None else None
+
     def __init__(self, constraint=None):
         """
         Initialize the column description.
@@ -67,10 +84,7 @@ class BoolColumn(Column):
                             meaning no constraint.
         """
         assert constraint is None or isinstance(constraint, Constraint)
-        super().__init__(
-            "INT", constraint=constraint,
-            unpack=lambda x: bool(x) if x is not None else None
-        )
+        super().__init__("INT", constraint=constraint)
 
 
 class TextColumn(Column):
@@ -84,20 +98,31 @@ class TextColumn(Column):
             constraint:     The column's constraint.
                             A member of the Constraint enum, or None,
                             meaning no constraint.
-            pack:           The function packing the JSON representation of
-                            column's values into the SQLite representation.
-            unpack:         The function unpacking the SQLite representation
-                            of column's values into the JSON representation.
         """
         assert constraint is None or isinstance(constraint, Constraint)
         assert pack is None or callable(pack)
         assert unpack is None or callable(unpack)
-        super().__init__("TEXT", constraint=constraint,
-                         pack=pack, unpack=unpack)
+        super().__init__("TEXT", constraint=constraint)
 
 
 class JSONColumn(TextColumn):
     """A JSON-encoded column"""
+
+    @staticmethod
+    def pack(value):
+        """
+        Pack the JSON representation of the column value into the SQLite
+        representation.
+        """
+        return json.dumps(value) if value is not None else None
+
+    @staticmethod
+    def unpack(value):
+        """
+        Unpack the SQLite representation of the column value into the JSON
+        representation.
+        """
+        return json.loads(value) if value is not None else None
 
     def __init__(self, constraint=None):
         """
@@ -110,10 +135,34 @@ class JSONColumn(TextColumn):
         """
         assert constraint is None or isinstance(constraint, Constraint)
 
-        super().__init__(
-            constraint=constraint,
-            pack=lambda x: json.dumps(x) if x is not None else None,
-            unpack=lambda x: json.loads(x) if x is not None else None)
+        super().__init__(constraint=constraint)
+
+
+class TimestampColumn(TextColumn):
+    """A normalized timestamp column"""
+
+    @staticmethod
+    def pack(value):
+        """
+        Pack the JSON representation of the column value into the SQLite
+        representation.
+        """
+        return dateutil.parser.isoparse(value).isoformat(
+            timespec='microseconds'
+        )
+
+    def __init__(self, constraint=None):
+        """
+        Initialize the column description.
+
+        Args:
+            constraint:     The column's constraint.
+                            A member of the Constraint enum, or None,
+                            meaning no constraint.
+        """
+        assert constraint is None or isinstance(constraint, Constraint)
+
+        super().__init__(constraint=constraint)
 
 
 # A map of table names to CREATE TABLE statements
@@ -131,7 +180,7 @@ TABLES = dict(
             "patchset_hash": TextColumn(),
             "message_id": TextColumn(),
             "comment": TextColumn(),
-            "start_time": TextColumn(),
+            "start_time": TimestampColumn(),
             "contacts": JSONColumn(),
             "log_url": TextColumn(),
             "log_excerpt": TextColumn(),
@@ -145,7 +194,7 @@ TABLES = dict(
             "id": TextColumn(constraint=Constraint.PRIMARY_KEY),
             "origin": TextColumn(constraint=Constraint.NOT_NULL),
             "comment": TextColumn(),
-            "start_time": TextColumn(),
+            "start_time": TimestampColumn(),
             "duration": Column("REAL"),
             "architecture": TextColumn(),
             "command": TextColumn(),
@@ -165,7 +214,6 @@ TABLES = dict(
             "build_id": TextColumn(constraint=Constraint.NOT_NULL),
             "id": TextColumn(constraint=Constraint.PRIMARY_KEY),
             "origin": TextColumn(constraint=Constraint.NOT_NULL),
-            "environment.id": TextColumn(),
             "environment.comment": TextColumn(),
             "environment.misc": JSONColumn(),
             "path": TextColumn(),
@@ -174,7 +222,7 @@ TABLES = dict(
             "log_excerpt": TextColumn(),
             "status": TextColumn(),
             "waived": BoolColumn(),
-            "start_time": TextColumn(),
+            "start_time": TimestampColumn(),
             "duration": Column("REAL"),
             "output_files": JSONColumn(),
             "misc": JSONColumn()
@@ -229,7 +277,7 @@ OO_QUERIES = dict(
             git_repository_branch=TextColumn(),
             tree_name=TextColumn(),
             message_id=TextColumn(),
-            start_time=TextColumn(),
+            start_time=TimestampColumn(),
             log_url=TextColumn(),
             log_excerpt=TextColumn(),
             comment=TextColumn(),
@@ -261,7 +309,7 @@ OO_QUERIES = dict(
             id=TextColumn(),
             checkout_id=TextColumn(),
             origin=TextColumn(),
-            start_time=TextColumn(),
+            start_time=TimestampColumn(),
             duration=Column("REAL"),
             architecture=TextColumn(),
             command=TextColumn(),
@@ -306,7 +354,7 @@ OO_QUERIES = dict(
             log_excerpt=TextColumn(),
             status=TextColumn(),
             waived=BoolColumn(),
-            start_time=TextColumn(),
+            start_time=TimestampColumn(),
             duration=Column("REAL"),
             output_files=JSONColumn(),
             comment=TextColumn(),
